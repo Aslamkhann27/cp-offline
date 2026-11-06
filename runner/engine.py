@@ -57,15 +57,21 @@ def _read_capped(path, cap=OUT_CAP):
     return data.decode("utf-8", "replace"), total > cap, total
 
 
+_SIGNAL_DESCRIPTIONS = {
+    "SIGSEGV": ("SIGSEGV", "Segmentation fault (invalid memory access: out-of-range index, null/dangling pointer, or stack overflow from deep recursion)"),
+    "SIGABRT": ("SIGABRT", "Aborted (uncaught C++ exception, failed assert, or memory corruption detected)"),
+    "SIGFPE": ("SIGFPE", "Floating point exception (usually integer division or modulo by zero)"),
+    "SIGBUS": ("SIGBUS", "Bus error (invalid memory access)"),
+    "SIGILL": ("SIGILL", "Illegal instruction"),
+    "SIGKILL": ("SIGKILL", "Process was killed (often out of memory)"),
+    "SIGXFSZ": ("SIGXFSZ", "Output limit exceeded (the program wrote far too much output)"),
+    "SIGTERM": ("SIGTERM", "Process was terminated"),
+}
+# Windows does not expose every POSIX signal (notably SIGBUS and SIGXFSZ).
 _SIGNAMES = {
-    signal.SIGSEGV: ("SIGSEGV", "Segmentation fault (invalid memory access: out-of-range index, null/dangling pointer, or stack overflow from deep recursion)"),
-    signal.SIGABRT: ("SIGABRT", "Aborted (uncaught C++ exception, failed assert, or memory corruption detected)"),
-    signal.SIGFPE: ("SIGFPE", "Floating point exception (usually integer division or modulo by zero)"),
-    signal.SIGBUS: ("SIGBUS", "Bus error (invalid memory access)"),
-    signal.SIGILL: ("SIGILL", "Illegal instruction"),
-    signal.SIGKILL: ("SIGKILL", "Process was killed (often out of memory)"),
-    signal.SIGXFSZ: ("SIGXFSZ", "Output limit exceeded (the program wrote far too much output)"),
-    signal.SIGTERM: ("SIGTERM", "Process was terminated"),
+    getattr(signal, name): description
+    for name, description in _SIGNAL_DESCRIPTIONS.items()
+    if hasattr(signal, name)
 }
 
 
@@ -82,27 +88,39 @@ def run_process(cmd, stdin_text="", timeout=TIME_LIMIT, cwd=None,
         in_p, out_p, err_p = (os.path.join(tmp, n) for n in ("in", "out", "err"))
         with open(in_p, "w", encoding="utf-8", errors="replace") as f:
             f.write(stdin_text or "")
-        wrapped = ["/bin/sh", "-c",
-                   _LIMITS.format(vm=vm_kb, fsz=OUTPUT_FILE_LIMIT_KB), "sh", *cmd]
+        # The original ulimit/process-group wrapper is POSIX-only. On Windows,
+        # launch the executable directly and kill it on timeout.
+        is_windows = os.name == "nt"
+        wrapped = list(cmd) if is_windows else [
+            "/bin/sh", "-c",
+            _LIMITS.format(vm=vm_kb, fsz=OUTPUT_FILE_LIMIT_KB), "sh", *cmd
+        ]
         start = time.perf_counter()
         timed_out = False
         with open(in_p, "rb") as fin, open(out_p, "wb") as fout, \
                 open(err_p, "wb") as ferr:
+            popen_kwargs = {}
+            if not is_windows:
+                popen_kwargs["start_new_session"] = True
             proc = subprocess.Popen(
                 wrapped, stdin=fin, stdout=fout, stderr=ferr, cwd=cwd,
-                env=_CLEAN_ENV, start_new_session=True)
+                env=_CLEAN_ENV, **popen_kwargs)
             try:
                 proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
                 timed_out = True
             finally:
-                # Always reap the whole process group (also grandchildren),
-                # even on timeout or if the server thread is interrupted.
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    if timed_out:
+                if is_windows:
+                    # Windows has no os.killpg; terminate the launched process.
+                    if proc.poll() is None:
                         proc.kill()
+                else:
+                    # Reap the whole POSIX process group, including children.
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        if timed_out and proc.poll() is None:
+                            proc.kill()
                 proc.wait()
         ms = int((time.perf_counter() - start) * 1000)
         out, t1, n1 = _read_capped(out_p)
@@ -140,7 +158,7 @@ def classify_failure(r, language):
     if rc == 0:
         return None
     # Python ignores SIGXFSZ and fails with OSError(EFBIG) instead; C++ is killed.
-    if (r.get("signal") == signal.SIGXFSZ or "Errno 27" in err
+    if (r.get("signal") == getattr(signal, "SIGXFSZ", None) or "Errno 27" in err
             or "File too large" in err
             or r.get("stdout_total", 0) >= OUTPUT_FILE_LIMIT_KB * 512 * 0.9):
         return ("RUNTIME ERROR", "output_limit", "Output Limit Exceeded",
@@ -151,7 +169,7 @@ def classify_failure(r, language):
                 "The program tried to use more than 1 GiB of memory.")
     if r.get("signal"):
         name, desc = r["signal_name"], r["signal_desc"]
-        if r["signal"] == signal.SIGKILL:
+        if r["signal"] == getattr(signal, "SIGKILL", None):
             return ("MEMORY LIMIT EXCEEDED", "memory", "Memory Limit Exceeded",
                     "The process was killed by the system, which usually means it ran out of memory.")
         return ("RUNTIME ERROR", "signal", "Runtime Error (%s)" % name, desc)
@@ -258,7 +276,7 @@ class Workspace:
         self.cmd, self.compile_error = None, None
 
     def clean(self, text):
-        return (text or "").replace(str(self.dir) + "/", "")
+        return (text or "").replace(str(self.dir) + "/", "").replace(str(self.dir) + "\\\\", "")
 
     def prepare(self):
         if self.language == "python":
@@ -276,7 +294,8 @@ class Workspace:
                 pass
             self.cmd = [shutil.which("python3") or sys.executable, "-B", str(src)]
             return True
-        src, exe = self.dir / "main.cpp", self.dir / "main"
+        src = self.dir / "main.cpp"
+        exe = self.dir / ("main.exe" if os.name == "nt" else "main")
         src.write_text(self.code, encoding="utf-8")
         self.src = src
         ok, msg = _compile_cpp(src, exe)
